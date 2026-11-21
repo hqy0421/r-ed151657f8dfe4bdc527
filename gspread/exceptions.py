@@ -6,7 +6,7 @@ Exceptions used in gspread.
 
 """
 
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 from requests import Response
 
@@ -72,3 +72,40 @@ class APIError(GSpreadException):
 
 class SpreadsheetNotFound(GSpreadException):
     """Trying to open non-existent or inaccessible spreadsheet."""
+
+
+class BatchConflictError(GSpreadException):
+    """A batch number was already committed with different content or to a
+    different target worksheet.
+
+    The original receipt is available as the ``existing`` attribute, and the
+    batch number as ``batch_id``. A replay is never performed in that case:
+    append the new rows under a new batch number.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        batch_id: int,
+        existing: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.batch_id = batch_id
+        self.existing = existing
+
+
+class BatchReceiptLookupError(GSpreadException):
+    """The receipt of a batch could not be read or could not be verified.
+
+    Raised when the question "was this batch already committed?" cannot be
+    answered: the receipt is missing although the write reported success, the
+    stored receipt is malformed or belongs to unrelated metadata, or the
+    remote lookup itself failed. It is never safe to guess the outcome in
+    those cases — retry the lookup (or the call) later.
+
+    The batch number is available as ``batch_id``.
+    """
+
+    def __init__(self, message: str, batch_id: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.batch_id = batch_id

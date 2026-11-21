@@ -361,13 +361,90 @@ Update a range
    worksheet.update([[1, 2], [3, 4]], 'A1:B2')
 
 
+.. _appending-rows-exactly-once:
+
+Appending Rows Exactly Once
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``append_rows`` appends rows but cannot tell a retry from a new write: if a
+call times out after the server applied it, re-running it appends the rows a
+second time. When the caller has a fixed batch number — for example a scraped
+batch, written under its batch number — use ``append_rows_idempotent``
+(``append_row_idempotent`` for a single row, ``batch_append`` as an alias):
+
+.. code:: python
+
+   result = worksheet.append_rows_idempotent(
+       batch_id=20240517,
+       values=[["a", 1], ["b", 2]],
+   )
+
+   result.status            # "committed"
+   result.already_committed  # False
+
+Re-running the same call, even after a timeout, returns the receipt of the
+first commit instead of appending again:
+
+.. code:: python
+
+   replay = worksheet.append_rows_idempotent(
+       batch_id=20240517,
+       values=[["a", 1], ["b", 2]],
+   )
+
+   replay.status             # "already_committed"
+   replay.already_committed  # True
+   replay.row_count          # 0 — nothing was appended this time
+
+The rows and a receipt are written in a single atomic ``batchUpdate`` call.
+The receipt is developer metadata whose spreadsheet-scoped ID is derived from
+the batch number; it binds the batch number to the worksheet and to a digest
+of the content. Since the API rejects a batch that creates an existing
+metadata ID, two writers replaying the same batch at the same time can only
+append one copy — the other one observes the receipt and reports
+``already_committed``.
+
+Reusing a batch number for other content, or for another worksheet, raises
+:class:`~gspread.exceptions.BatchConflictError`:
+
+.. code:: python
+
+   try:
+       worksheet.append_rows_idempotent(20240517, [["different"]])
+   except gspread.BatchConflictError:
+       pass  # the batch number is taken; use a new one
+
+When the outcome of a request is unknown (timeout, connection error, server
+error), gspread reads the receipt back from the document. Only a verifiable
+receipt counts as success; if the lookup itself fails or the receipt cannot be
+verified, :class:`~gspread.exceptions.BatchReceiptLookupError` is raised and
+the outcome is never guessed. Pass ``max_attempts`` to change how many times
+the atomic write is attempted (default 3).
+
+Receipts are kept in the document forever — they are never updated nor
+deleted — so the outcome of any past batch can be checked at any time:
+
+.. code:: python
+
+   receipt = worksheet.get_append_receipt(20240517)
+   if receipt is not None:
+       print(receipt.batch_id, receipt.content_digest, receipt.committed_at)
+
+.. note::
+
+   Google allows 30,000 characters of developer metadata per spreadsheet,
+   plus 30,000 characters for each sheet, so the number of batch receipts a
+   document can hold is finite. Each receipt is a few hundred bytes.
+
+
 Serializing Values the Standard ``json`` Module Cannot Encode
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 gspread encodes request bodies with the standard library ``json`` module,
 which cannot encode some types such as ``datetime`` or ``Decimal``. The
-data-writing methods (``update``, ``batch_update``, ``append_row`` and
-``append_rows``) accept a ``default_serializer`` argument for these cases. It
+data-writing methods (``update``, ``batch_update``, ``append_row``,
+``append_rows`` and ``append_rows_idempotent``) accept a
+``default_serializer`` argument for these cases. It
 works exactly like the ``default`` argument of :func:`json.dumps`: it receives
 a value the encoder cannot handle and returns a JSON-serializable substitute.
 

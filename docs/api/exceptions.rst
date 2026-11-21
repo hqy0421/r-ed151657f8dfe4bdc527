@@ -3,6 +3,8 @@ Exceptions
 
 
 .. autoexception:: gspread.exceptions.APIError
+.. autoexception:: gspread.exceptions.BatchConflictError
+.. autoexception:: gspread.exceptions.BatchReceiptLookupError
 .. autoexception:: gspread.exceptions.GSpreadException
 .. autoexception:: gspread.exceptions.IncorrectCellLabel
 .. autoexception:: gspread.exceptions.InvalidInputValue

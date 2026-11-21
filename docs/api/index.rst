@@ -10,4 +10,5 @@ API Reference
    http_client
    models/index
    utils
+   idempotent
    exceptions

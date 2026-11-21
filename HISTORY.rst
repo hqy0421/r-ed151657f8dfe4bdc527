@@ -1,6 +1,17 @@
 Release History
 ===============
 
+6.3.0 (unreleased)
+------------------
+
+* Add ``Worksheet.append_rows_idempotent`` (and ``append_row_idempotent``,
+  ``batch_append``, ``get_append_receipt``): an exactly-once bulk append that
+  writes the rows and a receipt in one atomic ``batchUpdate`` call, so that
+  re-running a batch after a timeout never appends it twice.
+* Add ``HTTPClient.get_developer_metadata`` and
+  ``HTTPClient.search_developer_metadata``.
+* Add ``BatchConflictError`` and ``BatchReceiptLookupError`` exceptions.
+
 6.2.1 (2025-05-14)
 ------------------
 

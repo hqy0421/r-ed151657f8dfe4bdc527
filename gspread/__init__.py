@@ -1,6 +1,6 @@
 """Google Spreadsheets Python API"""
 
-__version__ = "6.2.1"
+__version__ = "6.3.0"
 __author__ = "Anton Burnashev"
 
 
@@ -15,6 +15,8 @@ from .auth import (
 from .cell import Cell
 from .client import Client
 from .exceptions import (
+    BatchConflictError,
+    BatchReceiptLookupError,
     GSpreadException,
     IncorrectCellLabel,
     NoValidUrlKeyFound,
@@ -55,6 +57,8 @@ __all__ = [
     "ValueRange",
 
     # from .exceptions
+    "BatchConflictError",
+    "BatchReceiptLookupError",
     "GSpreadException",
     "IncorrectCellLabel",
     "NoValidUrlKeyFound",

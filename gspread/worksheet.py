@@ -9,6 +9,7 @@ This module contains common worksheets' models.
 import re
 import warnings
 from collections import Counter
+from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -29,9 +30,26 @@ from typing import (
     Union,
 )
 
+from requests.exceptions import RequestException
+
 from .cell import Cell
-from .exceptions import GSpreadException
+from .exceptions import APIError, BatchReceiptLookupError, GSpreadException
 from .http_client import DefaultSerializerType, HTTPClient, ParamsType
+from .idempotent import (
+    ALREADY_COMMITTED,
+    COMMITTED,
+    RECEIPT_METADATA_KEY,
+    AppendReceipt,
+    BatchAppendResult,
+    build_receipt_payload,
+    check_receipt_matches,
+    compute_content_digest,
+    encode_rows,
+    metadata_id_for_batch_id,
+    serialize_receipt_payload,
+    validate_batch_id,
+    validate_values,
+)
 from .urls import WORKSHEET_DRIVE_URL
 from .utils import (
     DateTimeOption,
@@ -80,6 +98,22 @@ BatchData = TypedDict("BatchData", {"range": str, "values": List[List[Any]]})
 
 JSONResponse = MutableMapping[str, Any]
 ValueRangeType = TypeVar("ValueRangeType", bound="ValueRange")
+
+#: Error codes of a ``batchUpdate`` whose outcome is unknown: the request may
+#: have been applied before the failure was reported, so the receipt must be
+#: checked. Other API errors are a rejection of the whole batch (the API
+#: applies nothing when any request is invalid).
+_AMBIGUOUS_API_ERROR_CODES = frozenset(
+    [HTTPStatus.REQUEST_TIMEOUT, HTTPStatus.GATEWAY_TIMEOUT]
+)
+
+
+def _is_ambiguous_api_error(error: APIError) -> bool:
+    """True when an API error leaves the outcome of the write unknown."""
+    if error.code >= HTTPStatus.INTERNAL_SERVER_ERROR:
+        return True
+
+    return error.code in _AMBIGUOUS_API_ERROR_CODES
 
 
 class ValueRange(list):
@@ -1899,6 +1933,368 @@ class Worksheet:
         num_new_rows = len(values)
         self._properties["gridProperties"]["rowCount"] += num_new_rows
         return res
+
+    def append_rows_idempotent(
+        self,
+        batch_id: int,
+        values: Sequence[Sequence[Any]],
+        value_input_option: ValueInputOption = ValueInputOption.raw,
+        default_serializer: DefaultSerializerType = None,
+        max_attempts: int = 3,
+    ) -> BatchAppendResult:
+        """Appends rows exactly once, identified by a fixed batch number.
+
+        Unlike :meth:`append_rows`, re-running the call with the same
+        ``batch_id`` never appends the rows twice — for example after a
+        timeout that left the outcome of the previous attempt unknown.
+
+        The rows and a receipt are written in a **single atomic**
+        ``spreadsheets.batchUpdate`` call. The receipt is developer metadata
+        with a spreadsheet-scoped ID derived from ``batch_id``; it binds the
+        batch number to this worksheet and to a digest of the appended
+        content. Because the API rejects a batch that creates an existing
+        metadata ID, two writers replaying the same batch at the same time
+        can only append once: the loser sees the winner's receipt.
+
+        Behaviour on replay:
+
+        * same batch number, same worksheet and same content — nothing is
+          appended and the result has ``status == "already_committed"``;
+        * same batch number but different content or target worksheet —
+          :class:`~gspread.exceptions.BatchConflictError` is raised;
+        * the outcome of a request is unknown (timeout, connection error,
+          server error, metadata ID collision) — the receipt is read back
+          from the document and only a verifiable receipt counts as success.
+          If that lookup fails, or the receipt cannot be verified,
+          :class:`~gspread.exceptions.BatchReceiptLookupError` is raised and
+          the outcome is never guessed.
+
+        Receipts are kept forever: they are never updated nor deleted, so a
+        replay can always be checked against the original commit.
+
+        :param int batch_id: A fixed positive integer identifying the batch.
+            It must not be reused with other content.
+        :param list values: List of rows, each row a list of values.
+        :param value_input_option: (optional) How input data should be
+            interpreted: ``ValueInputOption.raw`` or
+            ``ValueInputOption.user_entered``. It is part of the content
+            digest.
+        :type value_input_option: :class:`~gspread.utils.ValueInputOption`
+        :param default_serializer: (optional) A callable applied to values
+            that the standard ``json`` encoder cannot serialize on its own.
+            See :meth:`append_rows`.
+        :type default_serializer: Callable[[Any], Any]
+        :param int max_attempts: (optional) How many times the atomic write
+            may be attempted when its outcome is unknown. Default 3.
+        :returns: A :class:`~gspread.idempotent.BatchAppendResult` mapping.
+        :raises gspread.exceptions.BatchConflictError: if the batch number was
+            already committed with another target or other content.
+        :raises gspread.exceptions.BatchReceiptLookupError: if the outcome of
+            the write cannot be verified.
+
+        Example::
+
+            result = worksheet.append_rows_idempotent(
+                batch_id=20240517,
+                values=[["a", 1], ["b", 2]],
+            )
+
+            result.status  # "committed", or "already_committed" on a replay
+
+        .. versionadded:: 6.3.0
+        """
+        batch_id = validate_batch_id(batch_id)
+        rows = validate_values(values)
+
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int):
+            raise TypeError("max_attempts must be an integer")
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+
+        digest = compute_content_digest(
+            self.id, rows, value_input_option, default_serializer
+        )
+        metadata_id = metadata_id_for_batch_id(batch_id)
+
+        last_error: Optional[BaseException] = None
+        maybe_applied = False
+
+        for _ in range(max_attempts):
+            existing = self._lookup_append_receipt(batch_id)
+            if existing is not None:
+                self._verify_receipt(existing, batch_id, digest)
+                if maybe_applied:
+                    # A receipt appeared after a write whose reply was lost:
+                    # this batch is committed and holds exactly one copy.
+                    return BatchAppendResult(COMMITTED, existing, len(rows))
+                return BatchAppendResult(ALREADY_COMMITTED, existing, 0)
+
+            try:
+                response = self.client.batch_update(
+                    self.spreadsheet_id,
+                    self._append_batch_body(
+                        batch_id,
+                        rows,
+                        digest,
+                        metadata_id,
+                        value_input_option,
+                        default_serializer,
+                    ),
+                )
+            except APIError as err:
+                if not _is_ambiguous_api_error(err):
+                    # The batch was rejected as a whole: nothing was applied.
+                    return self._resolve_rejected_batch(err, batch_id, digest)
+
+                # A 5xx or a gateway timeout may have been applied before the
+                # failure surfaced. The next iteration reads the receipt
+                # back; it never guesses.
+                maybe_applied = True
+                last_error = err
+                continue
+            except RequestException as err:
+                # Timeout, connection reset, ...: the batch may or may not
+                # have been applied. Never guess, look the receipt up.
+                maybe_applied = True
+                last_error = err
+                continue
+
+            return self._verified_commit_result(
+                response, batch_id, digest, metadata_id, len(rows)
+            )
+
+        raise BatchReceiptLookupError(
+            "the outcome of batch {} could not be verified after {} "
+            "attempt(s); the receipt could not be read back".format(
+                batch_id, max_attempts
+            ),
+            batch_id=batch_id,
+        ) from last_error
+
+    def append_row_idempotent(
+        self,
+        batch_id: int,
+        values: Sequence[Any],
+        value_input_option: ValueInputOption = ValueInputOption.raw,
+        default_serializer: DefaultSerializerType = None,
+        max_attempts: int = 3,
+    ) -> BatchAppendResult:
+        """Appends a single row exactly once. See :meth:`append_rows_idempotent`.
+
+        .. versionadded:: 6.3.0
+        """
+        return self.append_rows_idempotent(
+            batch_id,
+            [values],
+            value_input_option=value_input_option,
+            default_serializer=default_serializer,
+            max_attempts=max_attempts,
+        )
+
+    def batch_append(
+        self,
+        batch_id: int,
+        values: Sequence[Sequence[Any]],
+        value_input_option: ValueInputOption = ValueInputOption.raw,
+        default_serializer: DefaultSerializerType = None,
+        max_attempts: int = 3,
+    ) -> BatchAppendResult:
+        """Appends a batch of rows exactly once. Alias of
+        :meth:`append_rows_idempotent`.
+
+        .. versionadded:: 6.3.0
+        """
+        return self.append_rows_idempotent(
+            batch_id,
+            values,
+            value_input_option=value_input_option,
+            default_serializer=default_serializer,
+            max_attempts=max_attempts,
+        )
+
+    def get_append_receipt(self, batch_id: int) -> Optional[AppendReceipt]:
+        """Reads back the receipt of a batch without writing anything.
+
+        Use it to answer "was this batch already committed?" at any time.
+
+        :param int batch_id: The batch number to look up.
+        :returns: The :class:`~gspread.idempotent.AppendReceipt` of the batch,
+            or ``None`` if the batch was never committed.
+        :raises gspread.exceptions.BatchReceiptLookupError: if the receipt
+            cannot be read or cannot be verified.
+
+        .. versionadded:: 6.3.0
+        """
+        batch_id = validate_batch_id(batch_id)
+        return self._lookup_append_receipt(batch_id)
+
+    def _lookup_append_receipt(self, batch_id: int) -> Optional[AppendReceipt]:
+        """Read the receipt of a batch from the document.
+
+        :raises gspread.exceptions.BatchReceiptLookupError: when the lookup
+            fails or when the stored metadata cannot be verified.
+        """
+        metadata_id = metadata_id_for_batch_id(batch_id)
+
+        try:
+            metadata = self.client.get_developer_metadata(
+                self.spreadsheet_id, metadata_id
+            )
+        except APIError as err:
+            if err.code == HTTPStatus.NOT_FOUND:
+                return None
+            raise BatchReceiptLookupError(
+                "could not read the receipt of batch {} (metadata ID {}): "
+                "{}".format(batch_id, metadata_id, err),
+                batch_id=batch_id,
+            ) from err
+        except RequestException as err:
+            raise BatchReceiptLookupError(
+                "could not read the receipt of batch {} (metadata ID {}): "
+                "{}".format(batch_id, metadata_id, err),
+                batch_id=batch_id,
+            ) from err
+
+        return AppendReceipt.from_metadata(metadata, expected_batch_id=batch_id)
+
+    def _receipt_from_batch_update_response(
+        self,
+        response: Mapping[str, Any],
+        batch_id: int,
+        metadata_id: int,
+    ) -> Optional[AppendReceipt]:
+        """Build the receipt from the atomic batch reply, if it is verifiable."""
+        reply = next(
+            (
+                item
+                for item in response.get("replies", [])
+                if isinstance(item, Mapping) and "createDeveloperMetadata" in item
+            ),
+            None,
+        )
+
+        if not isinstance(reply, Mapping):
+            return None
+
+        metadata = reply["createDeveloperMetadata"].get("developerMetadata")
+        if not isinstance(metadata, Mapping):
+            return None
+
+        if metadata.get("metadataId") != metadata_id:
+            return None
+
+        return AppendReceipt.from_metadata(metadata, expected_batch_id=batch_id)
+
+    def _append_batch_body(
+        self,
+        batch_id: int,
+        rows: Sequence[Sequence[Any]],
+        digest: str,
+        metadata_id: int,
+        value_input_option: Any,
+        default_serializer: DefaultSerializerType,
+    ) -> Dict[str, Any]:
+        """Build the single atomic batch: appended rows + their receipt."""
+        payload = build_receipt_payload(
+            batch_id=batch_id,
+            spreadsheet_id=self.spreadsheet_id,
+            sheet_id=self.id,
+            sheet_title=self.title,
+            content_digest=digest,
+            row_count=len(rows),
+            column_count=max(len(row) for row in rows),
+        )
+
+        return {
+            "requests": [
+                {
+                    "appendCells": {
+                        "sheetId": self.id,
+                        "fields": "userEnteredValue",
+                        "rows": encode_rows(
+                            rows, value_input_option, default_serializer
+                        ),
+                    }
+                },
+                {
+                    "createDeveloperMetadata": {
+                        "developerMetadata": {
+                            "metadataId": metadata_id,
+                            "metadataKey": RECEIPT_METADATA_KEY,
+                            "metadataValue": serialize_receipt_payload(payload),
+                            "visibility": "DOCUMENT",
+                            "location": {"sheetId": self.id},
+                        }
+                    }
+                },
+            ]
+        }
+
+    def _resolve_rejected_batch(
+        self,
+        error: APIError,
+        batch_id: int,
+        digest: str,
+    ) -> BatchAppendResult:
+        """Turn a rejected batch into a replay or a conflict, if it lost a race.
+
+        The API applies nothing when any request of the batch is invalid, so
+        a rejection means nothing was appended. But the rejection may be a
+        lost race to create the receipt (metadata ID collision), in which
+        case a concurrent writer of this very batch has already committed it.
+        """
+        try:
+            existing = self._lookup_append_receipt(batch_id)
+        except BatchReceiptLookupError:
+            # A rejection is a definite failure; do not replace it with an
+            # "unknown outcome" error.
+            raise error
+
+        if existing is None:
+            raise error
+
+        self._verify_receipt(existing, batch_id, digest)
+        return BatchAppendResult(ALREADY_COMMITTED, existing, 0)
+
+    def _verified_commit_result(
+        self,
+        response: Mapping[str, Any],
+        batch_id: int,
+        digest: str,
+        metadata_id: int,
+        row_count: int,
+    ) -> BatchAppendResult:
+        """Verify a successful batch reply and build the committed result."""
+        receipt = self._receipt_from_batch_update_response(
+            response, batch_id=batch_id, metadata_id=metadata_id
+        )
+
+        if receipt is None:
+            # The reply did not echo a verifiable receipt. Only a verifiable
+            # remote receipt counts as success.
+            receipt = self._lookup_append_receipt(batch_id)
+
+        if receipt is None:
+            raise BatchReceiptLookupError(
+                "batch {} was written but its receipt could not be read "
+                "back; the outcome cannot be verified".format(batch_id),
+                batch_id=batch_id,
+            )
+
+        self._verify_receipt(receipt, batch_id, digest)
+        return BatchAppendResult(COMMITTED, receipt, row_count, response)
+
+    def _verify_receipt(
+        self, receipt: AppendReceipt, batch_id: int, digest: str
+    ) -> None:
+        """Check that a receipt describes this batch, or raise."""
+        check_receipt_matches(
+            receipt,
+            batch_id=batch_id,
+            spreadsheet_id=self.spreadsheet_id,
+            sheet_id=self.id,
+            content_digest=digest,
+        )
 
     def insert_row(
         self,

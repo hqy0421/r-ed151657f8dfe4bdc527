@@ -104,6 +104,43 @@ class WorksheetForwardsSerializerTest(TestCase):
         self.assertIs(client.values_append.call_args.args[4], self.MARKER)
 
 
+class DeveloperMetadataHTTPClientTest(TestCase):
+    def _make_client(self):
+        session = Mock()
+        response = Mock()
+        response.ok = True
+        response.json.return_value = {"metadataId": 123}
+        session.request.return_value = response
+        return HTTPClient(auth=None, session=session), session
+
+    def test_get_developer_metadata(self):
+        client, session = self._make_client()
+
+        result = client.get_developer_metadata("abc123", 1_000_000_007)
+
+        self.assertEqual(result, {"metadataId": 123})
+        _, kwargs = session.request.call_args
+        self.assertEqual(
+            kwargs["url"],
+            "https://sheets.googleapis.com/v4/spreadsheets/abc123"
+            "/developerMetadata/1000000007",
+        )
+
+    def test_search_developer_metadata(self):
+        client, session = self._make_client()
+        body = {"dataFilters": [{"developerMetadataLookup": {"metadataKey": "k"}}]}
+
+        client.search_developer_metadata("abc123", body)
+
+        _, kwargs = session.request.call_args
+        self.assertEqual(
+            kwargs["url"],
+            "https://sheets.googleapis.com/v4/spreadsheets/abc123"
+            "/developerMetadata:search",
+        )
+        self.assertEqual(kwargs["json"], body)
+
+
 class BackOffHTTPClientTest(TestCase):
     @staticmethod
     def _error_response(code, domain="global"):

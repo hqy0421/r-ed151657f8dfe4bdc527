@@ -34,6 +34,8 @@ from .urls import (
     DRIVE_FILES_API_V3_URL,
     DRIVE_FILES_UPLOAD_API_V2_URL,
     SPREADSHEET_BATCH_UPDATE_URL,
+    SPREADSHEET_DEVELOPER_METADATA_GET_URL,
+    SPREADSHEET_DEVELOPER_METADATA_SEARCH_URL,
     SPREADSHEET_SHEETS_COPY_TO_URL,
     SPREADSHEET_URL,
     SPREADSHEET_VALUES_APPEND_URL,
@@ -326,6 +328,38 @@ class HTTPClient:
 
         r = self.request("get", url, params=params)
 
+        return r.json()
+
+    def get_developer_metadata(self, id: str, metadata_id: int) -> Any:
+        """Lower-level method that directly calls `spreadsheets.developerMetadata.get <https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.developerMetadata/get>`_.
+
+        :param str id: the spreadsheet ID key
+        :param int metadata_id: the spreadsheet-scoped ID of the metadata
+        :returns: the `DeveloperMetadata <https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.developerMetadata#developermetadata>`_
+            resource
+        :rtype: dict
+
+        .. versionadded:: 6.3.0
+        """
+        url = SPREADSHEET_DEVELOPER_METADATA_GET_URL % (id, metadata_id)
+        r = self.request("get", url)
+        return r.json()
+
+    def search_developer_metadata(
+        self, id: str, body: Optional[Mapping[str, Any]] = None
+    ) -> Any:
+        """Lower-level method that directly calls `spreadsheets.developerMetadata.search <https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.developerMetadata/search>`_.
+
+        :param str id: the spreadsheet ID key
+        :param dict body: (optional) `SearchDeveloperMetadataRequest <https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.developerMetadata/search#SearchDeveloperMetadataRequest>`_
+            body
+        :returns: `SearchDeveloperMetadataResponse <https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.developerMetadata/search#SearchDeveloperMetadataResponse>`_
+        :rtype: dict
+
+        .. versionadded:: 6.3.0
+        """
+        url = SPREADSHEET_DEVELOPER_METADATA_SEARCH_URL % id
+        r = self.request("post", url, json=body)
         return r.json()
 
     def get_file_drive_metadata(self, id: str) -> Any:
